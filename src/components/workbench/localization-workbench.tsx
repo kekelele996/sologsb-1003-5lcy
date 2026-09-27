@@ -5,8 +5,8 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
-  Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
-  Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
+  Languages, Link2, Loader2, Merge, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
+  Send, ShieldCheck, Sparkles, Split, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,7 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { analyzeDocument, extractProtected, parseMarkdown, proportionalSourceCut, renderTargetMarkdown, segmentKind, validateMerge, validateSplit } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
 import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -31,12 +31,19 @@ const statusClass: Record<SegmentStatus, string> = {
 const issueLabel: Record<TranslationIssue['type'], string> = {
   'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
 }
+const actionLabel: Record<HistoryEntry['action'], string> = {
+  edit: '编辑', confirm: '确认', return: '退回', 'resolve-conflict': '冲突处理', import: '导入', discussion: '讨论', structure: '结构调整',
+}
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 interface EditorSnapshot {
   segments: Segment[]
   discussions: Discussion[]
 }
+
+type StructurePreview =
+  | { type: 'merge'; ids: string[] }
+  | { type: 'split'; segmentId: string; sourceCut: number; targetCut: number }
 
 export function LocalizationWorkbench() {
   const fileInput = useRef<HTMLInputElement>(null)
@@ -57,6 +64,9 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [mergeMode, setMergeMode] = useState(false)
+  const [mergeSelection, setMergeSelection] = useState<string[]>([])
+  const [structurePreview, setStructurePreview] = useState<StructurePreview | null>(null)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -136,6 +146,14 @@ export function LocalizationWorkbench() {
   const filteredGlossary = glossary.filter((term) => `${term.source} ${term.target}`.toLowerCase().includes(glossarySearch.toLowerCase()))
   const selectedDiscussions = discussions.filter((discussion) => discussion.segmentId === selectedSegment?.id)
   const mockConnected = documentQuery.isFetched && historyQuery.isFetched && conflictQuery.isFetched
+  const mergeParts = structurePreview?.type === 'merge'
+    ? structurePreview.ids.map((id) => segments.find((segment) => segment.id === id)).filter((segment): segment is Segment => Boolean(segment))
+    : []
+  const mergeReasons = structurePreview?.type === 'merge'
+    ? [...(mergeParts.length !== structurePreview.ids.length ? ['部分所选片段已不存在，请重新选择。'] : []), ...validateMerge(mergeParts, segments)]
+    : []
+  const splitSegment = structurePreview?.type === 'split' ? segments.find((segment) => segment.id === structurePreview.segmentId) ?? null : null
+  const splitReasons = splitSegment && structurePreview?.type === 'split' ? validateSplit(splitSegment, structurePreview.sourceCut, structurePreview.targetCut) : []
 
   useEffect(() => {
     if (hydrated) return
@@ -274,6 +292,81 @@ export function LocalizationWorkbench() {
       return next
     })
   }
+  const toggleMergeMode = () => {
+    setMergeMode((current) => !current)
+    setMergeSelection([])
+  }
+  const toggleMergeSelection = (segmentId: string) => {
+    setMergeSelection((current) => current.includes(segmentId) ? current.filter((id) => id !== segmentId) : [...current, segmentId])
+  }
+  const openMergePreview = () => {
+    const ordered = segments.filter((segment) => mergeSelection.includes(segment.id)).map((segment) => segment.id)
+    setStructurePreview({ type: 'merge', ids: ordered })
+  }
+  const requestSplit = (segment: Segment) => {
+    const textarea = document.getElementById(`target-${segment.id}`) as HTMLTextAreaElement | null
+    const targetCut = textarea?.selectionStart ?? 0
+    const sourceCut = proportionalSourceCut(segment.sourceText, segment.targetText, targetCut)
+    setStructurePreview({ type: 'split', segmentId: segment.id, sourceCut, targetCut })
+  }
+  const confirmMerge = () => {
+    if (structurePreview?.type !== 'merge' || mergeReasons.length) return
+    const parts = mergeParts
+    const removedIds = new Set(parts.map((part) => part.id))
+    const firstPosition = Math.min(...parts.map((part) => segments.findIndex((segment) => segment.id === part.id)))
+    const mergedId = `segment-merge-${Date.now()}`
+    const sourceText = parts.map((part) => part.sourceText).join('\n\n')
+    const targetText = parts.map((part) => part.targetText).filter((text) => text.trim()).join('\n\n')
+    const hadConfirmed = parts.some((part) => part.status === 'confirmed')
+    const status: SegmentStatus = hadConfirmed ? 'needs-work'
+      : parts.some((part) => part.status === 'returned') ? 'returned'
+        : parts.some((part) => part.status === 'needs-work') ? 'needs-work' : 'draft'
+    const merged: Segment = {
+      id: mergedId, index: 0, kind: segmentKind(sourceText, false), sourceText, targetText, status,
+      protectedTokens: extractProtected(sourceText), note: parts.map((part) => part.note).filter(Boolean).join('；'),
+    }
+    const nextSegments = segments
+      .flatMap((segment, position) => position === firstPosition ? [merged] : removedIds.has(segment.id) ? [] : [segment])
+      .map((segment, position) => ({ ...segment, index: position + 1 }))
+    const nextDiscussions = discussions.map((discussion) => removedIds.has(discussion.segmentId) ? { ...discussion, segmentId: mergedId } : discussion)
+    replaceState({ segments: nextSegments, discussions: nextDiscussions })
+    setHistory((current) => current.map((entry) => removedIds.has(entry.segmentId) ? { ...entry, segmentId: mergedId } : entry))
+    pushHistoryEntry(mergedId, 'structure', parts.map((part) => `#${part.index}`).join('、'), `合并 ${parts.length} 个相邻片段${hadConfirmed ? '，已确认内容回到待处理' : ''}`)
+    setConflicts((current) => current.map((conflict) => removedIds.has(conflict.segmentId) ? { ...conflict, segmentId: mergedId } : conflict))
+    setSelectedForReturn((current) => { const copy = new Set(current); removedIds.forEach((id) => copy.delete(id)); return copy })
+    setMergeSelection([])
+    setMergeMode(false)
+    setStructurePreview(null)
+    selectAndScroll(mergedId)
+  }
+  const confirmSplit = () => {
+    if (structurePreview?.type !== 'split' || !splitSegment || splitReasons.length) return
+    const segment = splitSegment
+    const { sourceCut, targetCut } = structurePreview
+    const sourceParts = [segment.sourceText.slice(0, sourceCut).trim(), segment.sourceText.slice(sourceCut).trim()]
+    const targetParts = [segment.targetText.slice(0, targetCut).trim(), segment.targetText.slice(targetCut).trim()]
+    const status: SegmentStatus = segment.status === 'confirmed' ? 'needs-work' : segment.status
+    const stamp = Date.now()
+    const makePart = (partNumber: 1 | 2): Segment => ({
+      id: `segment-split-${stamp}-${partNumber}`, index: 0, kind: segmentKind(sourceParts[partNumber - 1], false),
+      sourceText: sourceParts[partNumber - 1], targetText: targetParts[partNumber - 1], status,
+      protectedTokens: extractProtected(sourceParts[partNumber - 1]), note: segment.note,
+    })
+    const first = makePart(1)
+    const second = makePart(2)
+    const nextSegments = segments
+      .flatMap((item) => item.id === segment.id ? [first, second] : [item])
+      .map((item, position) => ({ ...item, index: position + 1 }))
+    const nextDiscussions = discussions.map((discussion) => discussion.segmentId === segment.id ? { ...discussion, segmentId: first.id } : discussion)
+    replaceState({ segments: nextSegments, discussions: nextDiscussions })
+    setHistory((current) => current.map((entry) => entry.segmentId === segment.id ? { ...entry, segmentId: first.id } : entry))
+    pushHistoryEntry(first.id, 'structure', `#${segment.index}`, `在译文光标处拆分为两段${segment.status === 'confirmed' ? '，已确认内容回到待处理' : ''}，讨论与历史跟随前半段`)
+    pushHistoryEntry(second.id, 'structure', `#${segment.index}`, '由拆分产生的后半段')
+    setConflicts((current) => current.map((conflict) => conflict.segmentId === segment.id ? { ...conflict, segmentId: first.id } : conflict))
+    setSelectedForReturn((current) => { const copy = new Set(current); copy.delete(segment.id); return copy })
+    setStructurePreview(null)
+    selectAndScroll(first.id)
+  }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -362,7 +455,11 @@ export function LocalizationWorkbench() {
             <div className="flex items-center rounded-lg bg-slate-100 p-1">
               {([['all', '全部'], ['issues', '问题'], ['untranslated', '漏译'], ['confirmed', '已确认']] as const).map(([value, label]) => <button key={value} onClick={() => setFilter(value)} className={cn('rounded-md px-3 py-1.5 text-xs font-medium transition', filter === value ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800')}>{label}</button>)}
             </div>
-            <div className="ml-auto flex items-center gap-2 text-xs text-slate-500"><span>{filteredSegments.length} / {segments.length}</span><Button variant="outline" size="sm" onClick={() => nextIssue(-1)}><ArrowUp className="h-3.5 w-3.5" />上一问题</Button><Button variant="outline" size="sm" onClick={() => nextIssue(1)}>下一问题<ArrowDown className="h-3.5 w-3.5" /></Button></div>
+            <div className="ml-auto flex items-center gap-2 text-xs text-slate-500">
+              <Button variant={mergeMode ? 'default' : 'outline'} size="sm" onClick={toggleMergeMode}><Merge className="h-3.5 w-3.5" />{mergeMode ? `合并模式 · 已选 ${mergeSelection.length}` : '合并片段'}</Button>
+              {mergeMode && <Button variant="secondary" size="sm" disabled={mergeSelection.length < 2} onClick={openMergePreview}>预览合并</Button>}
+              <span>{filteredSegments.length} / {segments.length}</span><Button variant="outline" size="sm" onClick={() => nextIssue(-1)}><ArrowUp className="h-3.5 w-3.5" />上一问题</Button><Button variant="outline" size="sm" onClick={() => nextIssue(1)}>下一问题<ArrowDown className="h-3.5 w-3.5" /></Button>
+            </div>
           </div>
 
           {filteredSegments.map((segment) => {
@@ -370,9 +467,10 @@ export function LocalizationWorkbench() {
             const isSelected = selectedSegment?.id === segment.id
             const isReturnSelected = selectedForReturn.has(segment.id)
             return (
-              <article id={`segment-${segment.id}`} key={segment.id} onClick={() => setSelectedSegmentId(segment.id)} className={cn('scroll-mt-32 overflow-hidden rounded-xl border bg-white shadow-sm transition', isSelected && 'ring-2 ring-blue-500/30', segment.status === 'returned' && 'border-red-200', segmentIssues.some((issue) => issue.severity === 'error') && 'border-red-200')}>
+              <article id={`segment-${segment.id}`} key={segment.id} onClick={() => setSelectedSegmentId(segment.id)} className={cn('scroll-mt-32 overflow-hidden rounded-xl border bg-white shadow-sm transition', isSelected && 'ring-2 ring-blue-500/30', mergeSelection.includes(segment.id) && 'ring-2 ring-blue-600/60', segment.status === 'returned' && 'border-red-200', segmentIssues.some((issue) => issue.severity === 'error') && 'border-red-200')}>
                 <header className="flex flex-wrap items-center gap-2 border-b bg-slate-50/80 px-3 py-2.5">
                   <input type="checkbox" checked={isReturnSelected} onChange={() => toggleReturnSelection(segment.id)} className="h-4 w-4 rounded border-slate-300 accent-blue-600" aria-label={`选择片段 ${segment.index}`} />
+                  {mergeMode && <button onClick={(event) => { event.stopPropagation(); toggleMergeSelection(segment.id) }} className={cn('flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-medium transition', mergeSelection.includes(segment.id) ? 'border-blue-600 bg-blue-600 text-white' : 'border-slate-300 text-slate-500 hover:border-blue-300 hover:text-blue-600')}>{mergeSelection.includes(segment.id) ? <Check className="h-3 w-3" /> : <Merge className="h-3 w-3" />}{mergeSelection.includes(segment.id) ? '已选入' : '选入合并'}</button>}
                   <span className="text-[11px] font-semibold text-slate-500">#{String(segment.index).padStart(2, '0')}</span>
                   <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[segment.kind]}{kindLabel[segment.kind]}</Badge>
                   <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[segment.status])}>{statusLabel[segment.status]}</span>
@@ -389,7 +487,7 @@ export function LocalizationWorkbench() {
                     {segment.note && <p className="mt-3 rounded-md bg-amber-50 px-2.5 py-1.5 text-[10px] text-amber-700">译者备注：{segment.note}</p>}
                   </div>
                   <div className="min-w-0 p-3.5">
-                    <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-wider text-blue-500">简体中文 · Target</span>{mode === 'translate' ? <Badge variant="outline" className="text-[9px]">编辑中</Badge> : <Badge variant="secondary" className="text-[9px]">审校只读</Badge>}</div>
+                    <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-wider text-blue-500">简体中文 · Target</span><div className="flex items-center gap-1.5">{mode === 'translate' && <button title="在译文光标处拆分为两段" onClick={(event) => { event.stopPropagation(); requestSplit(segment) }} className="flex items-center gap-1 rounded-md border border-slate-200 px-1.5 py-0.5 text-[9px] text-slate-500 transition hover:border-blue-300 hover:text-blue-600"><Split className="h-3 w-3" />拆分</button>}{mode === 'translate' ? <Badge variant="outline" className="text-[9px]">编辑中</Badge> : <Badge variant="secondary" className="text-[9px]">审校只读</Badge>}</div></div>
                     <Textarea id={`target-${segment.id}`} value={segment.targetText} readOnly={mode === 'review'} onChange={(event) => updateTarget(segment, event.target.value)} rows={Math.max(3, Math.ceil(segment.sourceText.length / 46))} className={cn('min-h-[84px] resize-y border-slate-200 bg-slate-50/40 text-sm leading-6 focus-visible:bg-white', segment.kind === 'code' && 'markdown-code text-xs')} placeholder="在此输入译文，或保留代码块原样…" />
                     {segment.protectedTokens.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{segment.protectedTokens.map((token) => <code key={token} className="rounded bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700">{token}</code>)}</div>}
                   </div>
@@ -412,7 +510,7 @@ export function LocalizationWorkbench() {
                 <div className="mt-4 space-y-3">{selectedDiscussions.map((discussion) => <div key={discussion.id} className="rounded-lg border p-3"><div className="flex items-center justify-between"><b className="text-xs text-slate-800">{discussion.author}</b><Badge variant={discussion.resolved ? 'success' : 'warning'}>{discussion.resolved ? '已解决' : '待回应'}</Badge></div><p className="mt-2 text-xs leading-5 text-slate-600">{discussion.body}</p><p className="mt-2 text-[10px] text-slate-400">{hydrated ? new Date(discussion.createdAt).toLocaleString('zh-CN') : null}</p></div>)}{!selectedDiscussions.length && <p className="py-8 text-center text-xs text-slate-400">当前片段还没有讨论</p>}</div>
               </TabsContent>
               <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
-              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
+              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {actionLabel[entry.action]}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
             </Tabs>
           </Card>
@@ -421,6 +519,76 @@ export function LocalizationWorkbench() {
       </main>
 
       {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      {structurePreview?.type === 'merge' && (
+        <div className="fixed inset-0 z-[60] grid place-items-center bg-slate-950/50 p-4">
+          <div className="max-h-[85vh] w-full max-w-2xl overflow-auto rounded-xl bg-white shadow-2xl">
+            <header className="flex items-center justify-between border-b px-5 py-3.5">
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Merge className="h-4 w-4 text-blue-600" />合并预览 · {mergeParts.length} 个片段</h2>
+              <Button variant="ghost" size="sm" onClick={() => setStructurePreview(null)}><X className="h-4 w-4" /></Button>
+            </header>
+            <div className="space-y-4 p-5">
+              <div className="flex flex-wrap gap-1.5">{mergeParts.map((part) => <Badge key={part.id} variant="outline" className="text-[10px]">#{part.index} · {kindLabel[part.kind]} · {statusLabel[part.status]}</Badge>)}</div>
+              {mergeReasons.length > 0 ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-3.5">
+                  <p className="flex items-center gap-1.5 text-xs font-semibold text-red-700"><CircleAlert className="h-3.5 w-3.5" />边界不完整，已停在预览</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-[11px] leading-5 text-red-600">{mergeReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                  <p className="mt-2 text-[10px] text-red-500">调整选择后重新预览，确认按钮在问题解决前保持不可用。</p>
+                </div>
+              ) : (
+                <>
+                  <div><p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">合并后源文</p><p className="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs leading-5 text-slate-700">{mergeParts.map((part) => part.sourceText).join('\n\n')}</p></div>
+                  <div><p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">合并后译文</p><p className="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs leading-5 text-slate-700">{mergeParts.map((part) => part.targetText).filter((text) => text.trim()).join('\n\n') || '（暂无译文）'}</p></div>
+                  <p className="rounded-lg bg-blue-50 px-3 py-2 text-[11px] leading-5 text-blue-700">确认后讨论与修改历史将跟随新片段{mergeParts.some((part) => part.status === 'confirmed') ? '，已确认内容回到待处理' : ''}，重开页面可查看同一编排。</p>
+                </>
+              )}
+            </div>
+            <footer className="flex justify-end gap-2 border-t px-5 py-3.5">
+              <Button variant="outline" size="sm" onClick={() => setStructurePreview(null)}>取消</Button>
+              <Button size="sm" disabled={mergeReasons.length > 0} onClick={confirmMerge}>确认合并</Button>
+            </footer>
+          </div>
+        </div>
+      )}
+
+      {structurePreview?.type === 'split' && splitSegment && (
+        <div className="fixed inset-0 z-[60] grid place-items-center bg-slate-950/50 p-4">
+          <div className="max-h-[85vh] w-full max-w-2xl overflow-auto rounded-xl bg-white shadow-2xl">
+            <header className="flex items-center justify-between border-b px-5 py-3.5">
+              <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Split className="h-4 w-4 text-blue-600" />拆分预览 · 片段 #{splitSegment.index}</h2>
+              <Button variant="ghost" size="sm" onClick={() => setStructurePreview(null)}><X className="h-4 w-4" /></Button>
+            </header>
+            <div className="space-y-4 p-5">
+              {splitReasons.length > 0 ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-3.5">
+                  <p className="flex items-center gap-1.5 text-xs font-semibold text-red-700"><CircleAlert className="h-3.5 w-3.5" />边界不完整，已停在预览</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-[11px] leading-5 text-red-600">{splitReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                  <p className="mt-2 text-[10px] text-red-500">移动译文光标后重新点击拆分，确认按钮在问题解决前保持不可用。</p>
+                </div>
+              ) : (
+                <>
+                  {([1, 2] as const).map((partNumber) => {
+                    const sourceText = partNumber === 1 ? splitSegment.sourceText.slice(0, structurePreview.sourceCut).trim() : splitSegment.sourceText.slice(structurePreview.sourceCut).trim()
+                    const targetText = partNumber === 1 ? splitSegment.targetText.slice(0, structurePreview.targetCut).trim() : splitSegment.targetText.slice(structurePreview.targetCut).trim()
+                    return (
+                      <div key={partNumber} className="rounded-lg border p-3.5">
+                        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-slate-400">新片段 {partNumber === 1 ? 'A（前半段）' : 'B（后半段）'}</p>
+                        <p className="max-h-24 overflow-auto whitespace-pre-wrap rounded-md bg-slate-50 p-2.5 text-xs leading-5 text-slate-700">{sourceText}</p>
+                        <p className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap rounded-md bg-blue-50/60 p-2.5 text-xs leading-5 text-blue-800">{targetText || '（暂无译文）'}</p>
+                      </div>
+                    )
+                  })}
+                  <p className="rounded-lg bg-blue-50 px-3 py-2 text-[11px] leading-5 text-blue-700">确认后讨论与修改历史跟随前半段{splitSegment.status === 'confirmed' ? '，已确认内容回到待处理' : ''}，重开页面可查看同一编排。</p>
+                </>
+              )}
+            </div>
+            <footer className="flex justify-end gap-2 border-t px-5 py-3.5">
+              <Button variant="outline" size="sm" onClick={() => setStructurePreview(null)}>取消</Button>
+              <Button size="sm" disabled={splitReasons.length > 0} onClick={confirmSplit}>确认拆分</Button>
+            </footer>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
