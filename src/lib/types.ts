@@ -44,7 +44,7 @@ export interface HistoryEntry {
   id: string
   segmentId: string
   author: string
-  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion'
+  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion' | 'merge' | 'split'
   before: string
   after: string
   createdAt: number
